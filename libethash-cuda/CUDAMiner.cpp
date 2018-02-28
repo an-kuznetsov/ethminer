@@ -26,9 +26,7 @@ using namespace eth;
 
 unsigned CUDAMiner::s_numInstances = 0;
 
-int CUDAMiner::s_devices[16] = {
-	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
-};
+vector<int> CUDAMiner::s_devices(MAX_MINERS, -1);
 
 struct CUDAChannel: public LogChannel
 {
@@ -37,8 +35,15 @@ struct CUDAChannel: public LogChannel
 	static const bool debug = false;
 };
 
+struct CUDASwitchChannel: public LogChannel
+{
+	static const char* name() { return EthOrange " cu"; }
+	static const int verbosity = 6;
+	static const bool debug = false;
+};
+
 #define cudalog clog(CUDAChannel)
-#define ETHCUDA_LOG(_contents) cudalog << _contents
+#define cudaswitchlog clog(CUDASwitchChannel)
 
 CUDAMiner::CUDAMiner(FarmFace& _farm, unsigned _index) :
 	Miner("cuda-", _farm, _index),
@@ -83,6 +88,8 @@ bool CUDAMiner::init(const h256& seed)
 	catch (std::runtime_error const& _e)
 	{
 		cwarn << "Error CUDA mining: " << _e.what();
+		if(s_exit)
+			exit(1);
 		return false;
 	}
 }
@@ -115,8 +122,11 @@ void CUDAMiner::workLoop()
 			}
 			uint64_t upper64OfBoundary = (uint64_t)(u64)((u256)current.boundary >> 192);
 			uint64_t startN = current.startNonce;
-			if (current.exSizeBits >= 0) 
-				startN = current.startNonce | ((uint64_t)index << (64 - 4 - current.exSizeBits)); // this can support up to 16 devices
+			if (current.exSizeBits >= 0)
+			{
+				// this can support up to 2^c_log2Max_miners devices
+				startN = current.startNonce | ((uint64_t)index << (64 - LOG2_MAX_MINERS - current.exSizeBits));
+			}
 			search(current.header.data(), upper64OfBoundary, (current.exSizeBits >= 0), startN, w);
 
 			// Check if we should stop.
@@ -133,12 +143,14 @@ void CUDAMiner::workLoop()
 	catch (std::runtime_error const& _e)
 	{
 		cwarn << "Error CUDA mining: " << _e.what();
+		if(s_exit)
+			exit(1);
 	}
 }
 
 void CUDAMiner::kick_miner()
 {
-	m_abort.store(true, std::memory_order_relaxed);
+	m_new_work.store(true, std::memory_order_relaxed);
 }
 
 void CUDAMiner::setNumInstances(unsigned _instances)
@@ -146,7 +158,7 @@ void CUDAMiner::setNumInstances(unsigned _instances)
         s_numInstances = std::min<unsigned>(_instances, getNumDevices());
 }
 
-void CUDAMiner::setDevices(const unsigned* _devices, unsigned _selectedDeviceCount)
+void CUDAMiner::setDevices(const vector<unsigned>& _devices, unsigned _selectedDeviceCount)
 {
         for (unsigned i = 0; i < _selectedDeviceCount; i++)
                 s_devices[i] = _devices[i];
@@ -192,20 +204,9 @@ void CUDAMiner::listDevices()
 	catch(std::runtime_error const& err)
 	{
 		cwarn << "CUDA error: " << err.what();
+		if(s_exit)
+			exit(1);
 	}
-}
-
-HwMonitor CUDAMiner::hwmon()
-{
-	dev::eth::HwMonitor hw;
-	if (nvmlh) {
-		unsigned int tempC = 0, fanpcnt = 0;
-		wrap_nvml_get_tempC(nvmlh, nvmlh->cuda_nvml_device_id[m_device_num], &tempC);
-		wrap_nvml_get_fanpcnt(nvmlh, nvmlh->cuda_nvml_device_id[m_device_num], &fanpcnt);
-		hw.tempC = tempC;
-		hw.fanP = fanpcnt;
-	}
-	return hw;
 }
 
 bool CUDAMiner::configureGPU(
@@ -216,11 +217,13 @@ bool CUDAMiner::configureGPU(
 	uint64_t _currentBlock,
 	unsigned _dagLoadMode,
 	unsigned _dagCreateDevice,
-	bool _noeval
+	bool _noeval,
+	bool _exit
 	)
 {
 	s_dagLoadMode = _dagLoadMode;
 	s_dagCreateDevice = _dagCreateDevice;
+	s_exit  = _exit;
 
 	if (!cuda_configureGPU(
 		getNumDevices(),
@@ -250,7 +253,7 @@ unsigned const CUDAMiner::c_defaultNumStreams = 2;
 
 bool CUDAMiner::cuda_configureGPU(
 	size_t numDevices,
-	const int* _devices,
+	const vector<int>& _devices,
 	unsigned _blockSize,
 	unsigned _gridSize,
 	unsigned _numStreams,
@@ -294,6 +297,8 @@ bool CUDAMiner::cuda_configureGPU(
 	}
 	catch (runtime_error)
 	{
+		if(s_exit)
+			exit(1);
 		return false;
 	}
 }
@@ -322,7 +327,8 @@ bool CUDAMiner::cuda_init(
 
 		// use selected device
 		m_device_num = _deviceId < numDevices -1 ? _deviceId : numDevices - 1;
-		nvmlh = wrap_nvml_create();
+		m_hwmoninfo.deviceType = HwMonitorInfoType::NVIDIA;
+		m_hwmoninfo.deviceIndex = m_device_num;
 
 		cudaDeviceProp device_props;
 		CUDA_SAFE_CALL(cudaGetDeviceProperties(&device_props, m_device_num));
@@ -426,6 +432,8 @@ cpyDag:
 	}
 	catch (runtime_error const&)
 	{
+		if(s_exit)
+			exit(1);
 		return false;
 	}
 }
@@ -478,7 +486,7 @@ void CUDAMiner::search(
 				m_search_buf[i]->count = 0;
 		}
 	}
-	uint64_t batch_size = s_gridSize * s_blockSize;
+	const uint32_t batch_size = s_gridSize * s_blockSize;
 	while (true)
 	{
 		m_current_index++;
@@ -519,12 +527,12 @@ void CUDAMiner::search(
 			if (found_count)
 				for (uint32_t i = 0; i < found_count; i++)
 					if (s_noeval)
-						farm.submitProof(Solution{nonces[i], *((const h256 *)mixes[i]), w, m_abort});
+						farm.submitProof(Solution{nonces[i], *((const h256 *)mixes[i]), w, m_new_work});
 					else
 					{
 						Result r = EthashAux::eval(w.seed, w.header, nonces[i]);
 						if (r.value < w.boundary)
-							farm.submitProof(Solution{nonces[i], r.mixHash, w, m_abort});
+							farm.submitProof(Solution{nonces[i], r.mixHash, w, m_new_work});
 						else
 						{
 							farm.failedSolution();
@@ -534,11 +542,15 @@ void CUDAMiner::search(
 
 			addHashCount(batch_size);
 			bool t = true;
-			if (m_abort.compare_exchange_strong(t, false))
+			if (m_new_work.compare_exchange_strong(t, false)) {
+				cudaswitchlog << "Switch time "
+					<< std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - workSwitchStart).count()
+					<< "ms.";
 				break;
+			}
 			if (shouldStop())
 			{
-				m_abort.store(false, std::memory_order_relaxed);
+				m_new_work.store(false, std::memory_order_relaxed);
 				break;
 			}
 		}

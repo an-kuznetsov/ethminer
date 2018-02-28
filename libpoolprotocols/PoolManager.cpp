@@ -5,13 +5,26 @@ using namespace std;
 using namespace dev;
 using namespace eth;
 
+static string diffToDisplay(double diff)
+{
+	static const char* k[] = {"hashes", "kilohashes", "megahashes", "gigahashes", "terahashes", "petahashes"};
+	uint32_t i = 0;
+	while ((diff > 1000.0) && (i < ((sizeof(k) / sizeof(char *)) - 2)))
+	{
+		i++;
+		diff = diff / 1000.0;
+	}
+	stringstream ss;
+	ss << fixed << setprecision(4) << diff << ' ' << k[i]; 
+	return ss.str();
+}
+
 PoolManager::PoolManager(PoolClient * client, Farm &farm, MinerType const & minerType) : Worker("main"), m_farm(farm), m_minerType(minerType)
 {
 	p_client = client;
 
 	p_client->onConnected([&]()
 	{
-		m_reconnectTry = 0;
 		cnote << "Connected to " + m_connections[m_activeConnectionIdx].host();
 		if (!m_farm.isMining())
 		{
@@ -29,17 +42,23 @@ PoolManager::PoolManager(PoolClient * client, Farm &farm, MinerType const & mine
 	p_client->onDisconnected([&]()
 	{
 		cnote << "Disconnected from " + m_connections[m_activeConnectionIdx].host();
-		if (m_farm.isMining())
-		{
-			cnote << "Shutting down miners...";
-			m_farm.stop();
-		}
-		tryReconnect();
+		if (m_running)
+			tryReconnect();
 	});
 	p_client->onWorkReceived([&](WorkPackage const& wp)
 	{
-		cnote << "Received new job #" + wp.header.hex().substr(0, 8) + " from " + m_connections[m_activeConnectionIdx].host();
+		m_reconnectTry = 0;
 		m_farm.setWork(wp);
+		if (wp.boundary != m_lastBoundary)
+		{
+			using namespace boost::multiprecision;
+
+			m_lastBoundary = wp.boundary;
+			static const uint512_t dividend("0x10000000000000000000000000000000000000000000000000000000000000000");
+			const uint256_t divisor(string("0x") + m_lastBoundary.hex());
+			cnote << "New pool difficulty:" << EthWhite << diffToDisplay(double(dividend / divisor)) << EthReset;
+		}
+		cnote << "Received new job" << wp.header << "from " + m_connections[m_activeConnectionIdx].host();
 	});
 	p_client->onSolutionAccepted([&](bool const& stale)
 	{
@@ -59,12 +78,17 @@ PoolManager::PoolManager(PoolClient * client, Farm &farm, MinerType const & mine
 	m_farm.onSolutionFound([&](Solution sol)
 	{
 		m_submit_time = std::chrono::steady_clock::now();
-		cnote << "Solution found; Submitting to " + m_connections[m_activeConnectionIdx].host() << "...";
-		cnote << "  Nonce:" << toHex(sol.nonce);
-		//cnote << "  headerHash:" << sol.work.header.hex();
-		//cnote << "  mixHash:" << sol.mixHash.hex();
+
+		if (sol.stale)
+			cnote << string(EthYellow "Stale nonce 0x") + toHex(sol.nonce) + " submitted to " + m_connections[m_activeConnectionIdx].host();
+		else
+			cnote << string("Nonce 0x") + toHex(sol.nonce) + " submitted to " + m_connections[m_activeConnectionIdx].host();
+
 		p_client->submitSolution(sol);
 		return false;
+	});
+	m_farm.onMinerRestart([&]() {
+		cwarn << "Miner restart currently not supported!";
 	});
 }
 
@@ -72,8 +96,14 @@ void PoolManager::stop()
 {
 	m_running = false;
 
+	if (p_client->isConnected())
+		p_client->disconnect();
+
 	if (m_farm.isMining())
+	{
+		cnote << "Shutting down miners...";
 		m_farm.stop();
+	}
 }
 
 void PoolManager::workLoop()
@@ -96,23 +126,24 @@ void PoolManager::workLoop()
 
 void PoolManager::addConnection(string const & host, string const & port, string const & user, string const & pass)
 {
-	if (host.empty()) {
+	if (host.empty())
 		return;
-	}
+
 	PoolConnection connection(host, port, user, pass);
 	m_connections.push_back(connection);
 
 	if (m_connections.size() == 1) {
 		p_client->setConnection(host, port, user, pass);
+		m_farm.set_pool_addresses(host, port, "", "");
 	}
 }
 
 void PoolManager::clearConnections()
 {
 	m_connections.clear();
-	if (p_client && p_client->isConnected()) {
+	m_farm.set_pool_addresses("", "", "", "");
+	if (p_client && p_client->isConnected())
 		p_client->disconnect();
-	}
 }
 
 void PoolManager::start()
@@ -161,6 +192,7 @@ void PoolManager::tryReconnect()
 		}
 		PoolConnection newConnection = m_connections[m_activeConnectionIdx];
 		p_client->setConnection(newConnection.host(), newConnection.port(), newConnection.user(), newConnection.pass());
+		m_farm.set_pool_addresses(newConnection.host(), newConnection.port(), "", "");
 		p_client->connect();
 	}
 }
